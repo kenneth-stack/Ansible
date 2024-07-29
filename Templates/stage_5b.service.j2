@@ -1,0 +1,15 @@
+[Unit]
+Description=Stage 5B Java Application
+After=network.target
+
+[Service]
+User={{ app_user }}
+WorkingDirectory={{ app_dir }}
+ExecStart=/usr/bin/java -jar {{ app_dir }}/target/*.jar
+EnvironmentFile=/etc/environment
+Restart=always
+StandardOutput=file:/var/log/stage_5b/out.log
+StandardError=file:/var/log/stage_5b/error.log
+
+[Install]
+WantedBy=multi-user.target

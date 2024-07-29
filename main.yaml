@@ -1,0 +1,208 @@
+- name: Automated Deployment and Configuration with Ansible
+  hosts: hng
+  become: yes
+  vars:
+    app_dir: /opt/stage_5b
+    app_user: hng
+    app_port: 3000
+    db_user: postgres 
+    db_password: Admin
+    db_name: hng_db
+    db_host: hng
+    ansible_remote_tmp: /tmp/ansible
+    repo_url: https://github.com/hngprojects/hng_boilerplate_java_web
+    repo_branch: devops
+    java_home: /usr/lib/jvm/java-17-openjdk-amd64
+
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Create hng user
+      user:
+        name: "{{ app_user }}"
+        state: present
+        shell: /bin/bash
+        groups: sudo
+
+    - name: Create /var/secrets directory
+      file:
+        path: /var/secrets
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Create /var/log/stage_5b directory
+      file:
+        path: /var/log/stage_5b
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: Create application directory with correct permissions
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+
+    - name: Clone the devops branch of the boilerplate repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ repo_branch }}"
+        force: yes
+      become: yes
+      become_user: "{{ app_user }}"
+      environment:
+        GIT_ASKPASS: /bin/true  # This helps to bypass any interactive git prompts
+
+    - name: Ensure /opt/stage_5b is owned by hng
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: Install dependencies
+      apt:
+        name:
+          - openjdk-17-jdk
+          - maven
+          - postgresql
+          - nginx
+          - rabbitmq-server
+        state: present
+
+    - name: Ensure PostgreSQL is running
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Configure PostgreSQL user
+      become: yes
+      shell: |
+        sudo -u postgres psql -c "DO \$\$
+        BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{{ db_user }}') THEN
+            CREATE USER {{ db_user }} WITH PASSWORD '{{ db_password }}' CREATEDB SUPERUSER;
+          END IF;
+        END
+        \$\$;"
+      args:
+        executable: /bin/bash  
+    
+    - name: Create PostgreSQL database
+      become: yes
+      become_user: postgres
+      shell: |
+        sudo -u postgres psql -c "CREATE DATABASE hng_db;"
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE hng_db TO {{ db_user }};"
+    
+    - name: Save PostgreSQL credentials
+      copy:
+        content: "Username: {{ db_user }}\nPassword: {{ db_password }}"
+        dest: /var/secrets/pg_pw.txt
+        owner: root
+        group: root
+        mode: '0600'   
+
+     
+    - name: Set environment variables
+      lineinfile:
+        dest: /etc/environment
+        line: "{{ item }}"
+      with_items:
+        - "SPRING_DATASOURCE_URL=jdbc:postgresql://{{ db_host }}:5432/{{ db_name }}"
+        - "SPRING_DATASOURCE_USERNAME={{ db_user }}"
+        - "SPRING_DATASOURCE_PASSWORD={{ db_password }}"
+        - "SPRING_DATASOURCE_DRIVER_CLASS_NAME=org.postgresql.Driver"
+        - "SPRING_JPA_DATABASE_PLATFORM=org.hibernate.dialect.PostgreSQLDialect"
+        - "SPRING_JPA_HIBERNATE_DDL_AUTO=update"    
+
+    - name: Ensure RabbitMQ is running
+      service:
+        name: rabbitmq-server
+        state: started
+        enabled: yes
+
+    - name: Install Maven wrapper
+      command: mvn -N io.takari:maven:wrapper
+      args:
+        chdir: "{{ app_dir }}"
+      become: yes
+      become_user: "{{ app_user }}"    
+
+    - name: Ensure Maven Wrapper is executable
+      file:
+        path: "{{ app_dir }}/mvnw"
+        mode: '0755'
+    
+
+    - name: Build application
+      command: ./mvnw clean package
+      args:
+        chdir: "{{ app_dir }}"
+      environment:
+        JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        MAVEN_OPTS: "-Xmx1024m"
+        SPRING_DATASOURCE_URL: "jdbc:postgresql://{{ db_host }}:5432/{{ db_name }}"
+        SPRING_DATASOURCE_USERNAME: "{{ db_user }}"
+        SPRING_DATASOURCE_PASSWORD: "{{ db_password }}"
+        SPRING_DATASOURCE_DRIVER_CLASS_NAME: "org.postgresql.Driver"
+        SPRING_JPA_DATABASE_PLATFORM: "org.hibernate.dialect.PostgreSQLDialect"
+        SPRING_JPA_HIBERNATE_DDL_AUTO: "update"
+      become: yes
+      become_user: "{{ app_user }}"
+
+
+    - name: Configure application service
+      template:
+        src: stage_5b.service.j2
+        dest: /etc/systemd/system/stage_5b.service
+
+    - name: Start and enable application service
+      systemd:
+        name: stage_5b
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Configure Nginx for reverse proxy
+      template:
+        src: nginx_stage_5b.conf.j2
+        dest: /etc/nginx/sites-available/stage_5b
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/stage_5b
+        dest: /etc/nginx/sites-enabled/stage_5b
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Ensure Nginx is running
+      service:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    - name: Ensure log files are owned by hng
+      file:
+        path: "{{ item }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+      loop:
+        - /var/log/stage_5b/error.log
+        - /var/log/stage_5b/out.log
