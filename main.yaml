@@ -1,15 +1,16 @@
 ---
 - name: Automated Deployment and Configuration with Ansible
-  hosts: local
+  hosts: hng
   become: yes
   vars:
     app_dir: /opt/stage_5b
-    app_user: ken
+    app_user: hng
     app_port: 3000
+    app_host: hng
     db_user: postgres 
     db_password: Admin
     db_name: hng_db
-    db_host: localhost
+    db_host: hng
     ansible_remote_tmp: /tmp/ansible
     repo_url: https://github.com/hngprojects/hng_boilerplate_java_web
     repo_branch: devops
