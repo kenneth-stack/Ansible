@@ -1,18 +1,20 @@
+---
 - name: Automated Deployment and Configuration with Ansible
-  hosts: hng
+  hosts: local
   become: yes
   vars:
     app_dir: /opt/stage_5b
-    app_user: hng
+    app_user: ken
     app_port: 3000
     db_user: postgres 
     db_password: Admin
     db_name: hng_db
-    db_host: hng
+    db_host: localhost
     ansible_remote_tmp: /tmp/ansible
     repo_url: https://github.com/hngprojects/hng_boilerplate_java_web
     repo_branch: devops
     java_home: /usr/lib/jvm/java-17-openjdk-amd64
+    ansible_python_interpreter: /usr/bin/python3
 
   tasks:
     - name: Update and upgrade apt packages
@@ -20,7 +22,7 @@
         update_cache: yes
         upgrade: dist
 
-    - name: Create hng user
+    - name: Create application user
       user:
         name: "{{ app_user }}"
         state: present
@@ -60,9 +62,9 @@
       become: yes
       become_user: "{{ app_user }}"
       environment:
-        GIT_ASKPASS: /bin/true  # This helps to bypass any interactive git prompts
+        GIT_ASKPASS: /bin/true
 
-    - name: Ensure /opt/stage_5b is owned by hng
+    - name: Ensure /opt/stage_5b is owned by application user
       file:
         path: "{{ app_dir }}"
         state: directory
@@ -86,35 +88,77 @@
         state: started
         enabled: yes
 
-    - name: Configure PostgreSQL user
+    - name: Configure PostgreSQL user and database
       become: yes
-      shell: |
-        sudo -u postgres psql -c "DO \$\$
-        BEGIN
-          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{{ db_user }}') THEN
-            CREATE USER {{ db_user }} WITH PASSWORD '{{ db_password }}' CREATEDB SUPERUSER;
-          END IF;
-        END
-        \$\$;"
-      args:
-        executable: /bin/bash  
-    
-    - name: Create PostgreSQL database
+      block:
+        - name: Create PostgreSQL user if not exists
+          shell: |
+            sudo -u postgres psql -c "DO \$\$ BEGIN
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{{ db_user }}') THEN
+              CREATE USER {{ db_user }} WITH PASSWORD '{{ db_password }}' CREATEDB SUPERUSER;
+            END IF;
+            END \$\$;"
+
+        - name: Create PostgreSQL database and grant privileges
+          shell: |
+            sudo -u postgres psql -c "CREATE DATABASE {{ db_name }};"
+            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_user }};"
+
+    - name: Check if PostgreSQL is installed
+      command: which psql
+      register: psql_check
+      ignore_errors: yes
+
+    - name: Display PostgreSQL installation status
+      debug:
+        msg: "PostgreSQL is {{ 'installed' if psql_check.rc == 0 else 'not installed' }}"
+
+    - name: Install PostgreSQL if not present
+      apt:
+        name: 
+          - postgresql
+          - postgresql-contrib
+        state: present
+      when: psql_check.rc != 0  
+
+    - name: Find PostgreSQL version
+      shell: ls /etc/postgresql
+      register: pg_version
+      when: psql_check.rc == 0
+
+    - name: Display PostgreSQL version
+      debug:
+        var: pg_version.stdout_lines
+      when: psql_check.rc == 0
+
+    - name: Set pg_hba.conf path
+      set_fact:
+        pg_hba_path: "/etc/postgresql/{{ pg_version.stdout_lines[0] }}/main/pg_hba.conf"
+      when: psql_check.rc == 0 and pg_version.stdout_lines | length > 0
+
+    - name: Update pg_hba.conf for local connections
       become: yes
-      become_user: postgres
-      shell: |
-        sudo -u postgres psql -c "CREATE DATABASE hng_db;"
-        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE hng_db TO {{ db_user }};"
-    
+      lineinfile:
+        path: "{{ pg_hba_path }}"
+        regexp: '^local\s+all\s+postgres\s+peer'
+        line: 'local   all   postgres   md5'
+      when: pg_hba_path is defined
+      notify: Restart PostgreSQL
+
+    - name: Ensure PostgreSQL is restarted
+      become: yes
+      service:
+        name: postgresql
+        state: restarted
+
     - name: Save PostgreSQL credentials
       copy:
         content: "Username: {{ db_user }}\nPassword: {{ db_password }}"
         dest: /var/secrets/pg_pw.txt
         owner: root
         group: root
-        mode: '0600'   
+        mode: '0600'
 
-     
     - name: Set environment variables
       lineinfile:
         dest: /etc/environment
@@ -125,7 +169,7 @@
         - "SPRING_DATASOURCE_PASSWORD={{ db_password }}"
         - "SPRING_DATASOURCE_DRIVER_CLASS_NAME=org.postgresql.Driver"
         - "SPRING_JPA_DATABASE_PLATFORM=org.hibernate.dialect.PostgreSQLDialect"
-        - "SPRING_JPA_HIBERNATE_DDL_AUTO=update"    
+        - "SPRING_JPA_HIBERNATE_DDL_AUTO=update"
 
     - name: Ensure RabbitMQ is running
       service:
@@ -133,25 +177,38 @@
         state: started
         enabled: yes
 
+    - name: Update pom.xml with Spring Boot dependencies
+      template:
+        src: pom.xml.j2
+        dest: "{{ app_dir }}/pom.xml"
+      become: yes
+      become_user: "{{ app_user }}"
+
+    - name: Copy application.properties
+      template:
+        src: application.properties.j2
+        dest: "{{ app_dir }}/src/main/resources/application.properties"
+      become: yes
+      become_user: "{{ app_user }}"
+
     - name: Install Maven wrapper
       command: mvn -N io.takari:maven:wrapper
       args:
         chdir: "{{ app_dir }}"
       become: yes
-      become_user: "{{ app_user }}"    
+      become_user: "{{ app_user }}"
 
     - name: Ensure Maven Wrapper is executable
       file:
         path: "{{ app_dir }}/mvnw"
         mode: '0755'
-    
 
     - name: Build application
       command: ./mvnw clean package
       args:
         chdir: "{{ app_dir }}"
       environment:
-        JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+        JAVA_HOME: "{{ java_home }}"
         MAVEN_OPTS: "-Xmx1024m"
         SPRING_DATASOURCE_URL: "jdbc:postgresql://{{ db_host }}:5432/{{ db_name }}"
         SPRING_DATASOURCE_USERNAME: "{{ db_user }}"
@@ -161,7 +218,6 @@
         SPRING_JPA_HIBERNATE_DDL_AUTO: "update"
       become: yes
       become_user: "{{ app_user }}"
-
 
     - name: Configure application service
       template:
@@ -197,7 +253,7 @@
         state: restarted
         enabled: yes
 
-    - name: Ensure log files are owned by hng
+    - name: Ensure log files are owned by application user
       file:
         path: "{{ item }}"
         owner: "{{ app_user }}"
@@ -206,3 +262,9 @@
       loop:
         - /var/log/stage_5b/error.log
         - /var/log/stage_5b/out.log
+
+  handlers:
+    - name: Restart PostgreSQL
+      service:
+        name: postgresql
+        state: restarted
