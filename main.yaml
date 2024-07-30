@@ -5,8 +5,6 @@
   vars:
     app_dir: /opt/stage_5b
     app_user: hng
-    app_port: 3000
-    app_host: hng
     db_user: postgres 
     db_password: Admin
     db_name: hng_db
